@@ -1,6 +1,4 @@
-import { MerkleTree}  from 'merkletreejs';
 import loadBls from "bls-signatures";
-import sha256 from 'crypto-js/sha256.js';
 import fs  from 'fs';
 
 

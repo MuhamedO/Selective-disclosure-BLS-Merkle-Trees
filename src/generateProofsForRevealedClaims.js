@@ -1,6 +1,5 @@
-import { MerkleTree}  from 'merkletreejs';
 import loadBls from "bls-signatures";
-import sha256 from 'crypto-js/sha256.js';
+import { buildPoseidonTree, getProof } from './poseidonMerkle.js';
 import fs  from 'fs';
 import bulletproofs from '@latticelabs/zkp-js/bulletproof.js'
 import { closestPowerOfTwo, stringToBigInt } from './utils.js';
@@ -16,37 +15,40 @@ const pedGenParams = PedGeneratorParams.generateParams(library, curveName);
 const PointFn = pedGenParams.PointFn;
 
 
-function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaimsFilePath) {
+async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaimsFilePath) {
   // Convert the claims object into an array of strings (key:value) for the leaves
    // Read claims JSON file
    const claimsData = JSON.parse(fs.readFileSync(claimsJsonFilePath, 'utf8'));
    const revealedClaims = JSON.parse(fs.readFileSync(revealedClaimsFilePath, 'utf8'));
    // Convert the claims object into an array of strings (key:value) for the leaves
-  
-   const leaves = Object.entries(claimsData.claims).map(([key, value]) =>{
+   const claimEntries = Object.entries(claimsData.claims);
+   const leaves = claimEntries.map(([key, value]) =>{
     if (typeof value === 'string')
       value = stringToBigInt(value)
     else 
       value = BigInt(Math.round(value))
-    return PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, BigInt(claimsData.salt),pedGenParams))
+    return PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, BigInt(claimsData.salt),pedGenParams));
     }
   );
+  
+  const leafIndexByKey = Object.fromEntries(claimEntries.map(([key], index) => [key, index]));
+
   // Create the Merkle tree
-  const tree = new MerkleTree(leaves, sha256, { sortPairs: true });
+  const tree = await buildPoseidonTree(leaves);
   // Generate proofs for the revealed claims
   const proofs = revealedClaims.disclosedClaims?.reduce((acc, claimKey) => {
     const claimValue = claimsData.claims[claimKey];
+    if (!(claimKey in leafIndexByKey)) {
+      throw new Error(`Claim "${claimKey}" not found in credential`);
+    }
     var value = claimValue;
     if (typeof value === 'string')
       value = stringToBigInt(value)
     else 
-    value = BigInt(Math.round(value));
+      value = BigInt(Math.round(value));
     var salt = BigInt(claimsData.salt)
     const claimString= PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, salt,pedGenParams))
-    const proof = tree.getProof(claimString).map(p => ({
-      position: p.position,
-      data: p.data.toString('hex')
-    }));
+    const proof = getProof(tree, leafIndexByKey[claimKey]);
     
     // Store the claim and its proof
     acc[claimKey] = {
@@ -59,16 +61,16 @@ function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaimsFileP
   }, {});
   const numericProof = revealedClaims.numericalClaims?.reduce((acc, claimKey) => {
     const claimValue = claimsData.claims[claimKey.claim];
+    if (!(claimKey.claim in leafIndexByKey)) {
+      throw new Error(`Numerical claim "${claimKey.claim}" not found in credential`);
+    }
     var value = claimValue;
     if (typeof value === 'string')
       value = CommitmentUtils.getPedersenCommitment(stringToBigInt(value),BigInt(claimsData.salt),pedGenParams)
     else 
       value =CommitmentUtils.getPedersenCommitment(BigInt(Math.round(value)), BigInt(claimsData.salt),pedGenParams)
-    const claimString=  PointFn.toHexString(value)
-    const proof = tree.getProof(claimString).map(p => ({
-      position: p.position,
-      data: p.data.toString('hex')
-    }));
+    const claimString=  PointFn.toHexString(value);
+    const proof = getProof(tree, leafIndexByKey[claimKey.claim]);
 
     const size = BigInt(closestPowerOfTwo(claimKey.max))
     const genParams = GeneratorParams.generateParams(size, library, curveName, pedGenParams);

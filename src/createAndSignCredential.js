@@ -1,6 +1,5 @@
-import { MerkleTree}  from 'merkletreejs';
 import loadBls from "bls-signatures";
-import sha256 from 'crypto-js/sha256.js';
+import { buildPoseidonTree } from './poseidonMerkle.js';
 import fs  from 'fs';
 import path  from 'path';
 import bulletproofs from '@latticelabs/zkp-js/bulletproof.js'
@@ -37,10 +36,10 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
   );
 
   // Create the Merkle tree
-  const tree = new MerkleTree(leaves, sha256, { sortPairs: true });
+  const tree = await buildPoseidonTree(leaves);
 
   // Get the Merkle root
-  const root = tree.getRoot().toString('hex');
+  const root = tree.root;
 
   // Read private key JSON file
   const privateKeyData = JSON.parse(fs.readFileSync(privateKeyJsonFilePath, 'utf8'));
