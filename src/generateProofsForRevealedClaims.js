@@ -1,35 +1,124 @@
 import loadBls from "bls-signatures";
 import { buildPoseidonTree, getProof } from './poseidonMerkle.js';
-import fs  from 'fs';
-import bulletproofs from '@latticelabs/zkp-js/bulletproof.js'
-import { closestPowerOfTwo, stringToBigInt } from './utils.js';
+import fs from 'fs';
+import { spawnSync } from 'child_process';
+import bulletproofs from '@latticelabs/zkp-js/bulletproof.js';
+import { stringToBigInt } from './utils.js';
+import {
+  computeLeafDigestHexFromEncoded,
+  encodeBound,
+  getClaimMeta,
+  isStarkNumericClaim,
+  loadClaimTags,
+} from './starkLeaf.js';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
 const GeneratorParams = bulletproofs.GeneratorParams;
-const library = "elliptic"
+const library = "elliptic";
 const curveName = "secp256k1";
 const CompressedBulletproof = bulletproofs.CompressedProofs;
 const ProofFactory = bulletproofs.ProofFactory;
 const pedGenParams = PedGeneratorParams.generateParams(library, curveName);
 const PointFn = pedGenParams.PointFn;
 
+const STARK_PROVER_BIN = process.env.STARK_PROVER_BIN || 'E:\\thesis\\stark prover\\stark_range_prover\\target\\debug\\stark_range_prover.exe';
+
+function ensureRustBinaryExists() {
+  if (!fs.existsSync(STARK_PROVER_BIN)) {
+    throw new Error(`STARK prover binary not found at ${STARK_PROVER_BIN}`);
+  }
+}
+
+function buildAllLeaves(claimsData, claimTags) {
+  const claimEntries = Object.entries(claimsData.claims);
+
+  const leaves = claimEntries.map(([key, value]) => {
+    if (isStarkNumericClaim(key, value, claimTags)) {
+      const witness = claimsData.numericWitness?.[key];
+      if (!witness) {
+        throw new Error(`Missing numericWitness for claim "${key}"`);
+      }
+      return computeLeafDigestHexFromEncoded(
+        BigInt(witness.encodedValue),
+        BigInt(witness.claimTag),
+        BigInt(witness.blinding)
+      );
+    }
+
+    let normalizedValue = value;
+    if (typeof normalizedValue === 'string') {
+      normalizedValue = stringToBigInt(normalizedValue);
+    } else {
+      normalizedValue = BigInt(Math.round(normalizedValue));
+    }
+
+    return PointFn.toHexString(
+      CommitmentUtils.getPedersenCommitment(normalizedValue, BigInt(claimsData.salt), pedGenParams)
+    );
+  });
+
+  return { claimEntries, leaves };
+}
+
+function bitLengthBigInt(n) {
+  let x = BigInt(n);
+  if (x < 0n) x = -x;
+  if (x === 0n) return 1;
+  return x.toString(2).length;
+}
+
+function nextPowerOfTwoInt(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+function generateStarkProofForClaim(claimKey, rawValue, witness, meta, reqMeta) {
+  ensureRustBinaryExists();
+
+  const encodedMin = encodeBound(reqMeta.min, meta.scale);
+  const encodedMax = encodeBound(reqMeta.max, meta.scale);
+  const rangeWidth = encodedMax - encodedMin;
+  if (rangeWidth < 0n) {
+    throw new Error(`Invalid range for ${claimKey}: min > max`);
+  }
+  const neededBits = bitLengthBigInt(rangeWidth);
+  const bits = nextPowerOfTwoInt(neededBits);
+  const outFile = `${claimKey}_proof.json`;
+
+  const args = [
+    'prove',
+    '--value', witness.encodedValue,
+    '--min', encodedMin.toString(),
+    '--max', encodedMax.toString(),
+    '--claim-tag', String(witness.claimTag),
+    '--blinding', witness.blinding,
+    '--bits', String(bits),
+    '--out', outFile,
+  ];
+
+  const res = spawnSync(STARK_PROVER_BIN, args, { encoding: 'utf8' });
+  if (res.status !== 0) {
+    throw new Error(`STARK prove failed for ${claimKey}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`);
+  }
+
+  return {
+    outFile,
+    encodedMin: encodedMin.toString(),
+    encodedMax: encodedMax.toString(),
+    bits,
+  };
+}
 
 async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaimsFilePath) {
   // Convert the claims object into an array of strings (key:value) for the leaves
    // Read claims JSON file
    const claimsData = JSON.parse(fs.readFileSync(claimsJsonFilePath, 'utf8'));
    const revealedClaims = JSON.parse(fs.readFileSync(revealedClaimsFilePath, 'utf8'));
+   const claimTags = loadClaimTags();
    // Convert the claims object into an array of strings (key:value) for the leaves
-   const claimEntries = Object.entries(claimsData.claims);
-   const leaves = claimEntries.map(([key, value]) =>{
-    if (typeof value === 'string')
-      value = stringToBigInt(value)
-    else 
-      value = BigInt(Math.round(value))
-    return PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, BigInt(claimsData.salt),pedGenParams));
-    }
-  );
+   const { claimEntries, leaves } = buildAllLeaves(claimsData, claimTags);
   
   const leafIndexByKey = Object.fromEntries(claimEntries.map(([key], index) => [key, index]));
 
@@ -46,61 +135,61 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
       value = stringToBigInt(value)
     else 
       value = BigInt(Math.round(value));
-    var salt = BigInt(claimsData.salt)
-    const claimString= PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, salt,pedGenParams))
+    
     const proof = getProof(tree, leafIndexByKey[claimKey]);
     
     // Store the claim and its proof
     acc[claimKey] = {
       value: claimValue,
-      salt: salt.toString(),
+      salt: BigInt(claimsData.salt).toString(),
       proof
     };
 
     return acc;
-  }, {});
-  const numericProof = revealedClaims.numericalClaims?.reduce((acc, claimKey) => {
-    const claimValue = claimsData.claims[claimKey.claim];
-    if (!(claimKey.claim in leafIndexByKey)) {
-      throw new Error(`Numerical claim "${claimKey.claim}" not found in credential`);
+  }, {}) || {};
+  const numericProof = revealedClaims.numericalClaims?.reduce((acc, reqMeta) => {
+    const claimKey = reqMeta.claim;
+    const claimValue = claimsData.claims[claimKey];
+    if (!(claimKey in leafIndexByKey)) {
+      throw new Error(`Numerical claim "${claimKey}" not found in credential`);
     }
-    var value = claimValue;
-    if (typeof value === 'string')
-      value = CommitmentUtils.getPedersenCommitment(stringToBigInt(value),BigInt(claimsData.salt),pedGenParams)
-    else 
-      value =CommitmentUtils.getPedersenCommitment(BigInt(Math.round(value)), BigInt(claimsData.salt),pedGenParams)
-    const claimString=  PointFn.toHexString(value);
-    const proof = getProof(tree, leafIndexByKey[claimKey.claim]);
+    const meta = getClaimMeta(claimKey, claimTags);
+    const witness = claimsData.numericWitness?.[claimKey];
+    if (!witness) {
+      throw new Error(`Missing numericWitness for claim "${claimKey}"`);
+    }
 
-    const size = BigInt(closestPowerOfTwo(claimKey.max))
-    const genParams = GeneratorParams.generateParams(size, library, curveName, pedGenParams);
-    const subResult = CommitmentUtils.getPedersenCommitment(BigInt(Math.round(claimValue))- BigInt(claimKey.min), BigInt(claimsData.salt)- BigInt(revealedClaims.salt), pedGenParams);
-    const subResult2 = CommitmentUtils.getPedersenCommitment(BigInt(claimKey.max)- BigInt(Math.round(claimValue)), BigInt(revealedClaims.salt)- BigInt(claimsData.salt), pedGenParams);
-    const uncompr_proof = ProofFactory.computeBulletproof(BigInt(Math.round(claimValue)) - BigInt(claimKey.min),  BigInt(claimsData.salt)- BigInt(revealedClaims.salt),  subResult, genParams, 0n, size,  false);
-    const uncompr_proof2 = ProofFactory.computeBulletproof(BigInt(claimKey.max)- BigInt(Math.round(claimValue)), BigInt(revealedClaims.salt)- BigInt(claimsData.salt),  subResult2, genParams, 0n, size,  false);
-    const compr_proof = uncompr_proof.compressProof(genParams,false);
-    const compr_proof2 = uncompr_proof2.compressProof(genParams,false);
-    const proof_json = compr_proof.toJson(false, PointFn);
-    const proof_json2 = compr_proof2.toJson(false, PointFn);
-
+    const leafDigest = computeLeafDigestHexFromEncoded(
+      BigInt(witness.encodedValue),
+      BigInt(witness.claimTag),
+      BigInt(witness.blinding)
+    );
+    const proof = getProof(tree, leafIndexByKey[claimKey]);
+    const stark = generateStarkProofForClaim(claimKey, claimValue, witness, meta, reqMeta);
 
     // Store the claim and its proof
-    acc[claimKey.claim] = {
-      value: claimString,
+    acc[claimKey] = {
+      leaf_digest: leafDigest,
       proof,
-      numerical_proof_low: proof_json,
-      numerical_proof_high: proof_json2,
-      numerical_value_low:  PointFn.toHexString(subResult),
-      numerical_value_high:  PointFn.toHexString(subResult2)
+      claim_tag: witness.claimTag,
+      scale: witness.scale,
+      raw_value: claimValue,
+      encoded_value: witness.encodedValue,
+      min: reqMeta.min,
+      max: reqMeta.max,
+      encoded_min: stark.encodedMin,
+      encoded_max: stark.encodedMax,
+      num_bits: stark.bits,
+      stark_proof_file: stark.outFile,
     };
 
     return acc;
-  }, {});
+  }, {}) || {};
 
   
   // Prepare the output object
   const output = {
-    revealedClaims: [proofs,numericProof]
+    revealedClaims: [proofs, numericProof]
   };
 
   // Write the output to a JSON file

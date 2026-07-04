@@ -1,18 +1,96 @@
 import loadBls from "bls-signatures";
 import { verifyProof } from './poseidonMerkle.js';
-import fs  from 'fs';
-import bulletproofs from '@latticelabs/zkp-js/bulletproof.js'
-import { closestPowerOfTwo, stringToBigInt } from './utils.js';
+import fs from 'fs';
+import { spawnSync } from 'child_process';
+import bulletproofs from '@latticelabs/zkp-js/bulletproof.js';
+import { stringToBigInt } from './utils.js';
+import {
+  encodeBound,
+  getClaimMeta,
+  loadClaimTags,
+} from './starkLeaf.js';
+import path from 'path';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
 const GeneratorParams = bulletproofs.GeneratorParams;
-const library = "elliptic"
+const library = "elliptic";
 const curveName = "secp256k1";
 const CompressedBulletproof = bulletproofs.CompressedProofs;
 const ProofFactory = bulletproofs.ProofFactory;
 const pedGenParams = PedGeneratorParams.generateParams(library, curveName);
 const PointFn = pedGenParams.PointFn;
+
+const STARK_PROVER_BIN =
+  process.env.STARK_PROVER_BIN ||
+  path.resolve(process.cwd(), 'stark_range_prover.exe');
+
+function ensureRustBinaryExists() {
+  if (!fs.existsSync(STARK_PROVER_BIN)) {
+    throw new Error(`STARK prover binary not found at ${STARK_PROVER_BIN}`);
+  }
+}
+
+function extractJsonIntegerField(rawJson, fieldName) {
+  const regex = new RegExp(`"${fieldName}"\\s*:\\s*(\\d+)`);
+  const match = rawJson.match(regex);
+  if (!match) {
+    throw new Error(`Could not extract integer field "${fieldName}" from STARK proof JSON`);
+  }
+  return BigInt(match[1]);
+}
+
+function verifyStarkProofFile(starkProofFile, numericItem, reqMeta, claimMeta) {
+  ensureRustBinaryExists();
+
+  if (!fs.existsSync(starkProofFile)) {
+    throw new Error(`STARK proof file not found: ${starkProofFile}`);
+  }
+
+  const rawProof = fs.readFileSync(starkProofFile, 'utf8');
+  // Extract exact integer values from raw JSON to avoid JS Number precision loss.
+  const proofMin = extractJsonIntegerField(rawProof, 'min');
+  const proofMax = extractJsonIntegerField(rawProof, 'max');
+  const proofNumBits = extractJsonIntegerField(rawProof, 'num_bits');
+  const proofClaimTag = extractJsonIntegerField(rawProof, 'claim_tag');
+  const proofLeafDigest = extractJsonIntegerField(rawProof, 'leaf_digest');
+
+  const expectedMin = encodeBound(reqMeta.min, claimMeta.scale);
+  const expectedMax = encodeBound(reqMeta.max, claimMeta.scale);
+  const expectedNumBits = BigInt(numericItem.num_bits);
+  const expectedClaimTag = BigInt(numericItem.claim_tag);
+  const expectedLeafDigest = BigInt(`0x${numericItem.leaf_digest}`);
+
+  if (proofMin !== expectedMin) {
+    throw new Error(`STARK proof min mismatch for ${reqMeta.claim}`);
+  }
+  if (proofMax !== expectedMax) {
+    throw new Error(`STARK proof max mismatch for ${reqMeta.claim}`);
+  }
+  if (proofNumBits !== expectedNumBits) {
+    throw new Error(`STARK proof num_bits mismatch for ${reqMeta.claim}`);
+  }
+  if (proofClaimTag !== expectedClaimTag) {
+    throw new Error(`STARK proof claim_tag mismatch for ${reqMeta.claim}`);
+  }
+  if (proofLeafDigest !== expectedLeafDigest) {
+    throw new Error(
+      `STARK proof leaf_digest mismatch for ${reqMeta.claim}: expected ${expectedLeafDigest.toString()} got ${proofLeafDigest.toString()}`
+    );
+  }
+
+  const res = spawnSync(STARK_PROVER_BIN, ['verify', '--proof', starkProofFile], {
+    encoding: 'utf8'
+  });
+
+  if (res.status !== 0) {
+    throw new Error(
+      `STARK verification failed for ${reqMeta.claim}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`
+    );
+  }
+
+  return true;
+}
 
 async function verifyClaims(proofsFilePath, rootSignatureFilePath, publicKeyFilePath, requiredClaimsFilePath) {
   // Initialize the BLS library
@@ -20,68 +98,86 @@ async function verifyClaims(proofsFilePath, rootSignatureFilePath, publicKeyFile
 
   // Read and parse the proofs file
   const { revealedClaims } = JSON.parse(fs.readFileSync(proofsFilePath, 'utf8'));
-  const requiredClaims  = JSON.parse(fs.readFileSync(requiredClaimsFilePath, 'utf8'));
+  const requiredClaims = JSON.parse(fs.readFileSync(requiredClaimsFilePath, 'utf8'));
 
   // Read and parse the root and signature file
   const { merkleRoot, signature } = JSON.parse(fs.readFileSync(rootSignatureFilePath, 'utf8'));
 
   // Read and parse the public key file
   const publicKeyData = JSON.parse(fs.readFileSync(publicKeyFilePath, 'utf8'));
+  const claimTags = loadClaimTags();
   const publicKeyHex = publicKeyData.publicKey;
-  const publicKey = bls.G1Element.from_bytes(Buffer.from(publicKeyHex,'hex'));
+  const publicKey = bls.G1Element.from_bytes(Buffer.from(publicKeyHex, 'hex'));
+
+  const disclosedGroup = revealedClaims[0] || {};
+  const numericGroup = revealedClaims[1] || {};
  
   // Verify each claim
   let isValidClaims = true;
-  for (const claimGroup of revealedClaims) {
-    for (const [key, item] of Object.entries(claimGroup)) {
-      let { value, salt, proof, numerical_proof_low, numerical_proof_high, numerical_value_low, numerical_value_high } = item;
-      var leaf = value;
-      if (salt){
-        if (typeof value === 'string')
-          value = stringToBigInt(value);
-        else 
-          value =  BigInt(Math.round(value));
-        leaf=  PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, BigInt(salt),pedGenParams));
-      }
-      let validTree =  await verifyProof(leaf, proof, merkleRoot); 
-      let validNumeric= true;
-      let validRangeLow= true;
-      let validRangeHigh = true;
-      if (numerical_proof_low){
-        const claimKey = requiredClaims.numericalClaims.find(x=>x.claim===key);
-        const size = BigInt(closestPowerOfTwo(claimKey.max));
-        const genParams = GeneratorParams.generateParams(size, library, curveName, pedGenParams);  
-        const proof_low = CompressedBulletproof.fromJsonString(
-          numerical_proof_low, 
-          genParams.pedGen.CurveFn, 
-          PointFn
-        );
-        const proof_high = CompressedBulletproof.fromJsonString(
-          numerical_proof_high, 
-          genParams.pedGen.CurveFn, 
-          PointFn
-        );
 
-        validRangeLow = proof_low.verify(0n, size, PointFn.fromHexString(numerical_value_low,genParams.pedGen.CurveFn), genParams);
+  for (const [key, item] of Object.entries(disclosedGroup)) {
+    let { value, salt, proof } = item;
+    if (!salt) {
+      isValidClaims = false;
+      break;
+    }
+    let normalizedValue = value;
+    if (typeof normalizedValue === 'string') {
+      normalizedValue = stringToBigInt(normalizedValue);
+    } else {
+      normalizedValue = BigInt(Math.round(normalizedValue));
+    }
 
-        validRangeHigh = proof_high.verify(0n, size, PointFn.fromHexString(numerical_value_high,genParams.pedGen.CurveFn), genParams);
-        const mini = CommitmentUtils.getPedersenCommitment(BigInt(claimKey.min), BigInt(requiredClaims.salt), pedGenParams);
-        const maxi = CommitmentUtils.getPedersenCommitment(BigInt(claimKey.max), BigInt(requiredClaims.salt), pedGenParams);
-
-        var sub= CommitmentUtils.comSubCom(PointFn.fromHexString(leaf,pedGenParams.CurveFn), mini, PointFn);
-        var sub2= CommitmentUtils.comSubCom(maxi, PointFn.fromHexString(leaf,pedGenParams.CurveFn), PointFn);
-        validNumeric=(PointFn.toHexString(sub)===numerical_value_low)&&(PointFn.toHexString(sub2)===numerical_value_high);
-      }
-      if (!(validTree && validNumeric && validRangeLow && validRangeHigh)) {
+    const leaf = PointFn.toHexString(
+      CommitmentUtils.getPedersenCommitment(normalizedValue, BigInt(salt), pedGenParams)
+    );
+    let validTree = await verifyProof(leaf, proof, merkleRoot);
+    if (!validTree) {
+      isValidClaims = false;
+      break;
+    }
+  } 
+  if (isValidClaims) {
+    for (const [key, item] of Object.entries(numericGroup)) {
+      const reqMeta = requiredClaims.numericalClaims.find(x => x.claim === key);
+      if (!reqMeta) {
         isValidClaims = false;
         break;
       }
+      const claimMeta = getClaimMeta(key, claimTags);
+
+      const validTree = await verifyProof(item.leaf_digest, item.proof, merkleRoot);
+      if (!validTree) {
+        isValidClaims = false;
+        break;
+      }
+      const expectedEncodedMin = encodeBound(reqMeta.min, claimMeta.scale).toString();
+      const expectedEncodedMax = encodeBound(reqMeta.max, claimMeta.scale).toString();
+
+      if (String(item.claim_tag) !== String(claimMeta.claim_tag)) {
+        isValidClaims = false;
+        break;
+      }
+      if (String(item.scale) !== String(claimMeta.scale)) {
+        isValidClaims = false;
+        break;
+      }
+      if (String(item.encoded_min) !== expectedEncodedMin) {
+        isValidClaims = false;
+        break;
+      }
+      if (String(item.encoded_max) !== expectedEncodedMax) {
+        isValidClaims = false;
+        break;
+      }
+
+      verifyStarkProofFile(item.stark_proof_file, item, reqMeta, claimMeta);
     }
-    if (!isValidClaims) break;
   }
 
   // Verify the signature
-  const isValidSignature = bls.AugSchemeMPL.verify(publicKey,
+  const isValidSignature = bls.AugSchemeMPL.verify(
+    publicKey,
     merkleRoot,
     bls.G2Element.from_bytes(Buffer.from(signature, 'hex'))
   );

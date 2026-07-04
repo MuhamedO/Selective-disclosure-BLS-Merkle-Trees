@@ -1,0 +1,10 @@
+{
+  "age": {
+    "claim_tag": 1,
+    "scale": 1
+  },
+  "GPA": {
+    "claim_tag": 2,
+    "scale": 100
+  }
+}

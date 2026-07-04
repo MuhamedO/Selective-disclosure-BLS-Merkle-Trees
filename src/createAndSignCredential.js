@@ -1,20 +1,33 @@
 import loadBls from "bls-signatures";
 import { buildPoseidonTree } from './poseidonMerkle.js';
-import fs  from 'fs';
-import path  from 'path';
-import bulletproofs from '@latticelabs/zkp-js/bulletproof.js'
+import fs from 'fs';
+import path from 'path';
+import { randomBytes } from 'crypto';
+import bulletproofs from '@latticelabs/zkp-js/bulletproof.js';
 import { stringToBigInt } from './utils.js';
+import {
+  computeLeafDigestHexFromEncoded,
+  encodeNumericClaimValue,
+  getClaimMeta,
+  isStarkNumericClaim,
+  loadClaimTags,
+} from './starkLeaf.js';
+
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
 const GeneratorParams = bulletproofs.GeneratorParams;
-const library = "elliptic"
+const library = "elliptic";
 const curveName = "secp256k1";
 const CompressedBulletproof = bulletproofs.CompressedProofs;
 const ProofFactory = bulletproofs.ProofFactory;
 const pedGenParams = PedGeneratorParams.generateParams(library, curveName);
 const PointFn = pedGenParams.PointFn;
 
+// Use 96-bit random blinding to stay comfortably inside Rust u128 range.
+function randomBlinding() {
+  return BigInt('0x' + randomBytes(12).toString('hex'));
+}
 
 async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePath) {
   // Initialize the BLS library
@@ -22,18 +35,40 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
 
   // Read claims JSON file
   const claimsData = JSON.parse(fs.readFileSync(claimsJsonFilePath, 'utf8'));
+  const claimTags = loadClaimTags();
 
   const salt = Rand.randUnder(pedGenParams.n);
+
+  const numericWitness = {};
+  const claimEntries = Object.entries(claimsData);
   // Convert the claims object into an array of strings (key:value) for the leaves
-  const leaves = Object.entries(claimsData).map(([key, value]) =>{
-    if (typeof value === 'string')
-      value = stringToBigInt(value)
-    else 
-      value = BigInt(Math.round(value));
-    
-    return PointFn.toHexString(CommitmentUtils.getPedersenCommitment(value, salt,pedGenParams))
+  const leaves = claimEntries.map(([key, value]) => {
+    if (isStarkNumericClaim(key, value, claimTags)) {
+      const meta = getClaimMeta(key, claimTags);
+      const blinding = randomBlinding();
+      const encodedValue = encodeNumericClaimValue(value, meta.scale);
+
+      numericWitness[key] = {
+        blinding: blinding.toString(),
+        encodedValue: encodedValue.toString(),
+        claimTag: meta.claim_tag,
+        scale: meta.scale,
+      };
+
+      return computeLeafDigestHexFromEncoded(encodedValue, meta.claim_tag, blinding);
     }
-  );
+
+    let normalizedValue = value;
+    if (typeof normalizedValue === 'string') {
+      normalizedValue = stringToBigInt(normalizedValue);
+    } else {
+      normalizedValue = BigInt(Math.round(normalizedValue));
+    }
+
+    return PointFn.toHexString(
+      CommitmentUtils.getPedersenCommitment(normalizedValue, salt, pedGenParams)
+    );
+  });
 
   // Create the Merkle tree
   const tree = await buildPoseidonTree(leaves);
@@ -46,7 +81,7 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
   const privateKeyHex = privateKeyData.privateKey;
 
   // Convert the private key back to a BLS PrivateKey object
-  const privateKey = bls.PrivateKey.fromBytes(Buffer.from(privateKeyHex, 'hex'),false);
+  const privateKey = bls.PrivateKey.fromBytes(Buffer.from(privateKeyHex, 'hex'), false);
 
   const signature = bls.AugSchemeMPL.sign(privateKey, root);
   // Sign the root with the private key
@@ -65,8 +100,9 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
   const output2 = {
     claims: claimsData,
     issuer: privateKeyData.issuer,
-    salt: salt.toString()
-  }
+    salt: salt.toString(),
+    numericWitness
+  };
 
   // Write the output to a JSON file
   const outputFilename = `${privateKeyData.issuer.replace(/[^a-z0-9]/gi, '_')}_${path.parse(claimsJsonFilePath).name}_signature.json`;
