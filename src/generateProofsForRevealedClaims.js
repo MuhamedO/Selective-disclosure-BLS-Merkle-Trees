@@ -11,6 +11,7 @@ import {
   isStarkNumericClaim,
   loadClaimTags,
 } from './starkLeaf.js';
+import path from 'path';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
@@ -22,7 +23,9 @@ const ProofFactory = bulletproofs.ProofFactory;
 const pedGenParams = PedGeneratorParams.generateParams(library, curveName);
 const PointFn = pedGenParams.PointFn;
 
-const STARK_PROVER_BIN = process.env.STARK_PROVER_BIN || 'E:\\thesis\\stark prover\\stark_range_prover\\target\\debug\\stark_range_prover.exe';
+const STARK_PROVER_BIN =
+  process.env.STARK_PROVER_BIN ||
+  path.resolve(process.cwd(), 'stark_range_prover.exe');
 
 function ensureRustBinaryExists() {
   if (!fs.existsSync(STARK_PROVER_BIN)) {
