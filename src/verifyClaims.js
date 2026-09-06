@@ -10,6 +10,7 @@ import {
   loadClaimTags,
 } from './starkLeaf.js';
 import path from 'path';
+import { randomBytes } from 'crypto';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
@@ -31,35 +32,91 @@ function ensureRustBinaryExists() {
   }
 }
 
-function extractJsonIntegerField(rawJson, fieldName) {
-  const regex = new RegExp(`"${fieldName}"\\s*:\\s*(\\d+)`);
-  const match = rawJson.match(regex);
-  if (!match) {
-    throw new Error(`Could not extract integer field "${fieldName}" from STARK proof JSON`);
+function assertDigits(value, fieldName) {
+  const str = String(value);
+  if (!/^\d+$/.test(str)) {
+    throw new Error(`Invalid numeric string for ${fieldName}: ${value}`);
   }
-  return BigInt(match[1]);
+  return str;
 }
 
-function verifyStarkProofFile(starkProofFile, numericItem, reqMeta, claimMeta) {
+function assertHex(value, fieldName) {
+  const str = String(value);
+  if (!/^[0-9a-fA-F]+$/.test(str)) {
+    throw new Error(`Invalid hex string for ${fieldName}`);
+  }
+  return str;
+}
+
+function writeTempStarkProofFile(starkProof) {
+  const proofBytesHex = assertHex(starkProof.proof_bytes_hex, 'proof_bytes_hex');
+
+  const min = assertDigits(starkProof.pub_inputs.min, 'min');
+  const max = assertDigits(starkProof.pub_inputs.max, 'max');
+  const numBits = assertDigits(starkProof.pub_inputs.num_bits, 'num_bits');
+  const claimTag = assertDigits(starkProof.pub_inputs.claim_tag, 'claim_tag');
+  const leafDigest = assertDigits(starkProof.pub_inputs.leaf_digest, 'leaf_digest');
+
+  const tempFilePath = path.resolve(
+    process.cwd(),
+    `.tmp_stark_proof_${Date.now()}_${randomBytes(4).toString('hex')}.json`
+  );
+
+  const rawJson = `{
+  "proof_bytes_hex": "${proofBytesHex}",
+  "pub_inputs": {
+    "min": ${min},
+    "max": ${max},
+    "num_bits": ${numBits},
+    "claim_tag": ${claimTag},
+    "leaf_digest": ${leafDigest}
+  }
+}`;
+
+  fs.writeFileSync(tempFilePath, rawJson, 'utf8');
+  return tempFilePath;
+}
+
+function bitLengthBigInt(n) {
+  let x = BigInt(n);
+  if (x < 0n) x = -x;
+  if (x === 0n) return 1;
+  return x.toString(2).length;
+}
+
+function nextPowerOfTwoInt(n) {
+  let p = 1;
+  while (p < n) p <<= 1;
+  return p;
+}
+
+function computeExpectedNumBits(encodedMin, encodedMax) {
+  const rangeWidth = encodedMax - encodedMin;
+  if (rangeWidth < 0n) {
+    throw new Error('Invalid numeric range: min > max');
+  }
+  const neededBits = bitLengthBigInt(rangeWidth);
+  return BigInt(nextPowerOfTwoInt(neededBits));
+}
+
+function verifyStarkProofObject(starkProof, leafDigestHex, reqMeta, claimMeta) {
   ensureRustBinaryExists();
 
-  if (!fs.existsSync(starkProofFile)) {
-    throw new Error(`STARK proof file not found: ${starkProofFile}`);
+  if (!starkProof || !starkProof.pub_inputs) {
+    throw new Error(`Missing embedded STARK proof for ${reqMeta.claim}`);
   }
 
-  const rawProof = fs.readFileSync(starkProofFile, 'utf8');
-  // Extract exact integer values from raw JSON to avoid JS Number precision loss.
-  const proofMin = extractJsonIntegerField(rawProof, 'min');
-  const proofMax = extractJsonIntegerField(rawProof, 'max');
-  const proofNumBits = extractJsonIntegerField(rawProof, 'num_bits');
-  const proofClaimTag = extractJsonIntegerField(rawProof, 'claim_tag');
-  const proofLeafDigest = extractJsonIntegerField(rawProof, 'leaf_digest');
+  const proofMin = BigInt(starkProof.pub_inputs.min);
+  const proofMax = BigInt(starkProof.pub_inputs.max);
+  const proofNumBits = BigInt(starkProof.pub_inputs.num_bits);
+  const proofClaimTag = BigInt(starkProof.pub_inputs.claim_tag);
+  const proofLeafDigest = BigInt(starkProof.pub_inputs.leaf_digest);
 
   const expectedMin = encodeBound(reqMeta.min, claimMeta.scale);
   const expectedMax = encodeBound(reqMeta.max, claimMeta.scale);
-  const expectedNumBits = BigInt(numericItem.num_bits);
-  const expectedClaimTag = BigInt(numericItem.claim_tag);
-  const expectedLeafDigest = BigInt(`0x${numericItem.leaf_digest}`);
+  const expectedNumBits = computeExpectedNumBits(expectedMin, expectedMax);
+  const expectedClaimTag = BigInt(claimMeta.claim_tag);
+  const expectedLeafDigest = BigInt(`0x${leafDigestHex}`);
 
   if (proofMin !== expectedMin) {
     throw new Error(`STARK proof min mismatch for ${reqMeta.claim}`);
@@ -74,19 +131,25 @@ function verifyStarkProofFile(starkProofFile, numericItem, reqMeta, claimMeta) {
     throw new Error(`STARK proof claim_tag mismatch for ${reqMeta.claim}`);
   }
   if (proofLeafDigest !== expectedLeafDigest) {
-    throw new Error(
-      `STARK proof leaf_digest mismatch for ${reqMeta.claim}: expected ${expectedLeafDigest.toString()} got ${proofLeafDigest.toString()}`
-    );
+    throw new Error(`STARK proof leaf_digest mismatch for ${reqMeta.claim}`);
   }
 
-  const res = spawnSync(STARK_PROVER_BIN, ['verify', '--proof', starkProofFile], {
-    encoding: 'utf8'
-  });
+  const tempProofFile = writeTempStarkProofFile(starkProof);
 
-  if (res.status !== 0) {
-    throw new Error(
-      `STARK verification failed for ${reqMeta.claim}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`
-    );
+  try {
+    const res = spawnSync(STARK_PROVER_BIN, ['verify', '--proof', tempProofFile], {
+      encoding: 'utf8'
+    });
+
+    if (res.status !== 0) {
+      throw new Error(
+        `STARK verification failed for ${reqMeta.claim}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`
+      );
+    }
+  } finally {
+    if (fs.existsSync(tempProofFile)) {
+      fs.unlinkSync(tempProofFile);
+    }
   }
 
   return true;
@@ -151,27 +214,8 @@ async function verifyClaims(proofsFilePath, rootSignatureFilePath, publicKeyFile
         isValidClaims = false;
         break;
       }
-      const expectedEncodedMin = encodeBound(reqMeta.min, claimMeta.scale).toString();
-      const expectedEncodedMax = encodeBound(reqMeta.max, claimMeta.scale).toString();
 
-      if (String(item.claim_tag) !== String(claimMeta.claim_tag)) {
-        isValidClaims = false;
-        break;
-      }
-      if (String(item.scale) !== String(claimMeta.scale)) {
-        isValidClaims = false;
-        break;
-      }
-      if (String(item.encoded_min) !== expectedEncodedMin) {
-        isValidClaims = false;
-        break;
-      }
-      if (String(item.encoded_max) !== expectedEncodedMax) {
-        isValidClaims = false;
-        break;
-      }
-
-      verifyStarkProofFile(item.stark_proof_file, item, reqMeta, claimMeta);
+      verifyStarkProofObject(item.stark_proof, item.leaf_digest, reqMeta, claimMeta);
     }
   }
 

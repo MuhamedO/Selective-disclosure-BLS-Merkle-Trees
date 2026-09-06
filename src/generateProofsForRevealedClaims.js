@@ -33,6 +33,39 @@ function ensureRustBinaryExists() {
   }
 }
 
+function extractJsonStringField(rawJson, fieldName) {
+  const regex = new RegExp(`"${fieldName}"\\s*:\\s*"([^"]+)"`);
+  const match = rawJson.match(regex);
+  if (!match) {
+    throw new Error(`Could not extract string field "${fieldName}" from STARK proof JSON`);
+  }
+  return match[1];
+}
+
+function extractJsonIntegerFieldAsString(rawJson, fieldName) {
+  const regex = new RegExp(`"${fieldName}"\\s*:\\s*(\\d+)`);
+  const match = rawJson.match(regex);
+  if (!match) {
+    throw new Error(`Could not extract integer field "${fieldName}" from STARK proof JSON`);
+  }
+  return match[1];
+}
+
+function loadEmbeddedStarkProof(proofFilePath) {
+  const rawProof = fs.readFileSync(proofFilePath, 'utf8');
+
+  return {
+    proof_bytes_hex: extractJsonStringField(rawProof, 'proof_bytes_hex'),
+    pub_inputs: {
+      min: extractJsonIntegerFieldAsString(rawProof, 'min'),
+      max: extractJsonIntegerFieldAsString(rawProof, 'max'),
+      num_bits: extractJsonIntegerFieldAsString(rawProof, 'num_bits'),
+      claim_tag: extractJsonIntegerFieldAsString(rawProof, 'claim_tag'),
+      leaf_digest: extractJsonIntegerFieldAsString(rawProof, 'leaf_digest'),
+    }
+  };
+}
+
 function buildAllLeaves(claimsData, claimTags) {
   const claimEntries = Object.entries(claimsData.claims);
 
@@ -106,11 +139,16 @@ function generateStarkProofForClaim(claimKey, rawValue, witness, meta, reqMeta) 
     throw new Error(`STARK prove failed for ${claimKey}\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`);
   }
 
+  const embeddedProof = loadEmbeddedStarkProof(outFile);
+
+  // Delete the temporary standalone proof file now that it is embedded.
+  fs.unlinkSync(outFile);
+
   return {
-    outFile,
     encodedMin: encodedMin.toString(),
     encodedMax: encodedMax.toString(),
     bits,
+    embeddedProof,
   };
 }
 
@@ -174,16 +212,7 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
     acc[claimKey] = {
       leaf_digest: leafDigest,
       proof,
-      claim_tag: witness.claimTag,
-      scale: witness.scale,
-      raw_value: claimValue,
-      encoded_value: witness.encodedValue,
-      min: reqMeta.min,
-      max: reqMeta.max,
-      encoded_min: stark.encodedMin,
-      encoded_max: stark.encodedMax,
-      num_bits: stark.bits,
-      stark_proof_file: stark.outFile,
+      stark_proof: stark.embeddedProof,
     };
 
     return acc;
