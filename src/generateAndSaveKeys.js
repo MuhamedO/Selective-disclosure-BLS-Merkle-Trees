@@ -2,18 +2,23 @@
 import loadBls from "bls-signatures";
 import fs  from 'fs';
 import crypto from 'crypto';
-
+import path from 'path';
+import { performance } from 'perf_hooks';
 
 
 async function generateAndSaveKeys(issuerName) {
 
 
   var bls = await loadBls();
+  // === keygen_ms START ===
+  const _t0 = performance.now();
   // Generate a private key
   const privateKey = bls.AugSchemeMPL.key_gen(crypto.randomBytes(32));
 
   // Get the public key from the private key
   const publicKey = privateKey.get_g1();
+  const _t1 = performance.now();
+  // === keygen_ms END ===
 
   // Convert keys to hexadecimal strings for storage
   const privateKeyHex = bls.Util.hex_str(privateKey.serialize());
@@ -38,6 +43,17 @@ async function generateAndSaveKeys(issuerName) {
     if (err) throw err;
     console.log('Public key has been saved to ' + publicKeyFilename);
   });
+
+  // --- Metrics ---
+  const metrics = {
+    phase: 'keygen',
+    keygen_ms: _t1 - _t0
+  };
+  if (process.env.BENCH_OUT_DIR) {
+    const dir = process.env.BENCH_OUT_DIR;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `keygen_${issuerName}_metrics.json`), JSON.stringify(metrics, null, 2), 'utf8');
+  }
 }
 
 export default generateAndSaveKeys;

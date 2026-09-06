@@ -1,5 +1,7 @@
 import loadBls from "bls-signatures";
 import fs  from 'fs';
+import path from 'path';
+import { performance } from 'perf_hooks';
 
 
 async function aggregateClaimsAndSignatures(claimsFiles, rootSignatureFiles) {
@@ -23,11 +25,17 @@ async function aggregateClaimsAndSignatures(claimsFiles, rootSignatureFiles) {
     signatures.push(signature);
   });
 
+  // === total_aggregation_ms START ===
+  const _tAgg0 = performance.now();
+
   // Convert signatures from hex to Signature objects
   signatures = signatures.map(sigHex => bls.G2Element.fromBytes(Buffer.from(sigHex, 'hex')));
 
   // Aggregate the signatures
   const aggregatedSignature = bls.AugSchemeMPL.aggregate(signatures);
+
+  const _tAgg1 = performance.now();
+  // === total_aggregation_ms END ===
 
   // Prepare the output object
   const output = {
@@ -40,6 +48,29 @@ async function aggregateClaimsAndSignatures(claimsFiles, rootSignatureFiles) {
   fs.writeFileSync(outputFilename, JSON.stringify(output, null, 2), 'utf8');
 
   console.log(`Aggregated data saved to ${outputFilename}`);
+
+  // --- Metrics ---
+  const metrics = {
+    phase: 'aggregation',
+    total_aggregation_ms: _tAgg1 - _tAgg0
+  };
+
+  if (process.env.BENCH_OUT_DIR) {
+    const dir = process.env.BENCH_OUT_DIR;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'aggregation_metrics.json'), JSON.stringify(metrics, null, 2), 'utf8');
+  }
+
+  // --- Size metrics ---
+  if (process.env.BENCH_OUT_DIR) {
+    const dir = process.env.BENCH_OUT_DIR;
+    const aggFileBytes = fs.statSync(outputFilename).size;
+    const sizeMetrics = {
+      phase: 'aggregation_sizes',
+      aggregated_presentation_bytes: aggFileBytes
+    };
+    fs.writeFileSync(path.join(dir, 'aggregation_sizes_metrics.json'), JSON.stringify(sizeMetrics, null, 2), 'utf8');
+  }
 }
 
 // Example usage

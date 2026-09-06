@@ -11,6 +11,7 @@ import {
 } from './starkLeaf.js';
 import path from 'path';
 import { randomBytes } from 'crypto';
+import { performance } from 'perf_hooks';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
@@ -238,12 +239,23 @@ async function verifyAggregatedClaimsAndSignature(aggregatedFilePath, publicKeyF
     const aggregatedSignatureBytes = Buffer.from(aggregatedSignature, 'hex');
     const aggregatedSignatures = bls.G2Element.from_bytes(aggregatedSignatureBytes)
     
+    // === total_agg_verify_ms START ===
+    const _tTotal0 = performance.now();
+    const perCredentialVerifyMs = [];
+
     //Check each single validity
     for (let i = 0; i < rootSignatureFiles.length; i++) {
+        const _tCred0 = performance.now();
         const isValidClaim = await verifySingleAggregatedClaim(aggregatedClaims[i], rootSignatureFiles[i], publicKeyFiles[i], requiredClaimsFiles[i], claimTags);
+        
+        const _tCred1 = performance.now();
+        perCredentialVerifyMs.push(_tCred1 - _tCred0);
+        
         console.log(`Verification of claim and signature ${i + 1}: ${isValidClaim}`);
     }
     
+    // === bls_aggregate_verify_ms START ===
+    const _tBlsAgg0 = performance.now();
     // Aggregate all public keys
     let publicKeys = [];
     for (const filePath of publicKeyFiles) {
@@ -262,7 +274,27 @@ async function verifyAggregatedClaimsAndSignature(aggregatedFilePath, publicKeyF
     // Verify the aggregated signature with the aggregated public key
     const isValid = bls.AugSchemeMPL.aggregate_verify(publicKeys, roots, aggregatedSignatures);
 
+    const _tBlsAgg1 = performance.now();
+    // === bls_aggregate_verify_ms END ===
+
+    const _tTotal1 = performance.now();
+    // === total_agg_verify_ms END ===
+
     console.log(`Aggregated signature verification result: ${isValid}`);
+
+    // --- Metrics ---
+    const metrics = {
+      phase: 'agg_verify',
+      per_credential_verify_ms: perCredentialVerifyMs,
+      bls_aggregate_verify_ms: _tBlsAgg1 - _tBlsAgg0,
+      total_agg_verify_ms: _tTotal1 - _tTotal0
+    };
+
+    if (process.env.BENCH_OUT_DIR) {
+      const dir = process.env.BENCH_OUT_DIR;
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'agg_verify_metrics.json'), JSON.stringify(metrics, null, 2), 'utf8');
+    }
 }
 
 export default verifyAggregatedClaimsAndSignature;

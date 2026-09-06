@@ -12,6 +12,7 @@ import {
   loadClaimTags,
 } from './starkLeaf.js';
 import path from 'path';
+import { performance } from 'perf_hooks';
 const CommitmentUtils = bulletproofs.CommitmentUtils;
 const PedGeneratorParams = bulletproofs.PedGeneratorParams;
 const Rand = bulletproofs.Rand;
@@ -158,6 +159,9 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
    const claimsData = JSON.parse(fs.readFileSync(claimsJsonFilePath, 'utf8'));
    const revealedClaims = JSON.parse(fs.readFileSync(revealedClaimsFilePath, 'utf8'));
    const claimTags = loadClaimTags();
+
+   // === total_disclosure_ms START ===
+  const _tTotal0 = performance.now();
    // Convert the claims object into an array of strings (key:value) for the leaves
    const { claimEntries, leaves } = buildAllLeaves(claimsData, claimTags);
   
@@ -165,6 +169,8 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
 
   // Create the Merkle tree
   const tree = await buildPoseidonTree(leaves);
+  // === textual_disclosure_ms START ===
+  const _tText0 = performance.now();
   // Generate proofs for the revealed claims
   const proofs = revealedClaims.disclosedClaims?.reduce((acc, claimKey) => {
     const claimValue = claimsData.claims[claimKey];
@@ -188,7 +194,15 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
 
     return acc;
   }, {}) || {};
+
+  const _tText1 = performance.now();
+  // === textual_disclosure_ms END ===
+
+  // === numeric_disclosure_ms START ===
+  const _tNum0 = performance.now();
+  const perNumericClaimMs = {};
   const numericProof = revealedClaims.numericalClaims?.reduce((acc, reqMeta) => {
+    const _tClaim0 = performance.now();
     const claimKey = reqMeta.claim;
     const claimValue = claimsData.claims[claimKey];
     if (!(claimKey in leafIndexByKey)) {
@@ -215,10 +229,18 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
       stark_proof: stark.embeddedProof,
     };
 
+    const _tClaim1 = performance.now();
+    perNumericClaimMs[claimKey] = _tClaim1 - _tClaim0;
+
     return acc;
   }, {}) || {};
 
-  
+  const _tNum1 = performance.now();
+  // === numeric_disclosure_ms END ===
+
+  const _tTotal1 = performance.now();
+  // === total_disclosure_ms END ===
+
   // Prepare the output object
   const output = {
     revealedClaims: [proofs, numericProof]
@@ -229,6 +251,36 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
   fs.writeFileSync(outputFilename, JSON.stringify(output, null, 2), 'utf8');
 
   console.log(`Revealed claims and their proofs have been saved to ${outputFilename}`);
+
+  // --- Metrics ---
+  const metrics = {
+    phase: 'disclosure',
+    textual_disclosure_ms: _tText1 - _tText0,
+    numeric_disclosure_ms: _tNum1 - _tNum0,
+    per_numeric_claim_ms: perNumericClaimMs,
+    total_disclosure_ms: _tTotal1 - _tTotal0
+  };
+
+  if (process.env.BENCH_OUT_DIR) {
+    const dir = process.env.BENCH_OUT_DIR;
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const tag = claimsJsonFilePath.replace(/^.*[\\/]/, '').replace('.json', '');
+    fs.writeFileSync(path.join(dir, `disclosure_${tag}_metrics.json`), JSON.stringify(metrics, null, 2), 'utf8');
+  }
+
+  // --- Size metrics ---
+  if (process.env.BENCH_OUT_DIR) {
+    const dir = process.env.BENCH_OUT_DIR;
+    const revealedClaimsBytes = Buffer.byteLength(JSON.stringify(output), 'utf8');
+    const numericPortionBytes = numericProof ? Buffer.byteLength(JSON.stringify(numericProof), 'utf8') : 0;
+    const tag = claimsJsonFilePath.replace(/^.*[\\/]/, '').replace('.json', '');
+    const sizeMetrics = {
+      phase: 'disclosure_sizes',
+      revealed_claims_total_bytes: revealedClaimsBytes,
+      numeric_proof_portion_bytes: numericPortionBytes
+    };
+    fs.writeFileSync(path.join(dir, `disclosure_sizes_${tag}_metrics.json`), JSON.stringify(sizeMetrics, null, 2), 'utf8');
+  }
 }
 
 
