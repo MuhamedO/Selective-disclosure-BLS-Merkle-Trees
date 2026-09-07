@@ -97,7 +97,7 @@ function computeExpectedNumBits(encodedMin, encodedMax) {
     throw new Error('Invalid numeric range: min > max');
   }
   const neededBits = bitLengthBigInt(rangeWidth);
-  return BigInt(nextPowerOfTwoInt(neededBits));
+  return BigInt(Math.max(8, nextPowerOfTwoInt(neededBits)));
 }
 
 function verifyStarkProofObject(starkProof, leafDigestHex, reqMeta, claimMeta) {
