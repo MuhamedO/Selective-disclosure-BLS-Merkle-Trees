@@ -120,7 +120,7 @@ function generateStarkProofForClaim(claimKey, rawValue, witness, meta, reqMeta) 
     throw new Error(`Invalid range for ${claimKey}: min > max`);
   }
   const neededBits = bitLengthBigInt(rangeWidth);
-  const bits = nextPowerOfTwoInt(neededBits);
+  const bits = Math.max(8, nextPowerOfTwoInt(neededBits));
   const outFile = `${claimKey}_proof.json`;
 
   const args = [
