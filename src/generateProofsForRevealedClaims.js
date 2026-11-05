@@ -66,34 +66,41 @@ function loadEmbeddedStarkProof(proofFilePath) {
   };
 }
 
+function computeLeafForClaim(key, claim, claimTags) {
+  if (!claim || typeof claim !== 'object' || !('value' in claim)) {
+    throw new Error(
+      `Claim "${key}" has unexpected format (expected { value, ... }). ` +
+      `Credential was probably issued with the old format - reissue it.`
+    );
+  }
+
+  if (isStarkNumericClaim(key, claim.value, claimTags)) {
+    if (claim.blinding === undefined || claim.encodedValue === undefined || claim.claimTag === undefined) {
+      throw new Error(`Missing STARK witness fields (blinding/encodedValue/claimTag) for claim "${key}"`);
+    }
+    return computeLeafDigestHexFromEncoded(
+      BigInt(claim.encodedValue),
+      BigInt(claim.claimTag),
+      BigInt(claim.blinding)
+    );
+  }
+
+  if (claim.salt === undefined) {
+    throw new Error(`Missing salt for claim "${key}"`);
+  }
+
+  const normalizedValue = typeof claim.value === 'string'
+    ? stringToBigInt(claim.value)
+    : BigInt(Math.round(claim.value));
+
+  return PointFn.toHexString(
+    CommitmentUtils.getPedersenCommitment(normalizedValue, BigInt(claim.salt), pedGenParams)
+  );
+}
+
 function buildAllLeaves(claimsData, claimTags) {
   const claimEntries = Object.entries(claimsData.claims);
-
-  const leaves = claimEntries.map(([key, value]) => {
-    if (isStarkNumericClaim(key, value, claimTags)) {
-      const witness = claimsData.numericWitness?.[key];
-      if (!witness) {
-        throw new Error(`Missing numericWitness for claim "${key}"`);
-      }
-      return computeLeafDigestHexFromEncoded(
-        BigInt(witness.encodedValue),
-        BigInt(witness.claimTag),
-        BigInt(witness.blinding)
-      );
-    }
-
-    let normalizedValue = value;
-    if (typeof normalizedValue === 'string') {
-      normalizedValue = stringToBigInt(normalizedValue);
-    } else {
-      normalizedValue = BigInt(Math.round(normalizedValue));
-    }
-
-    return PointFn.toHexString(
-      CommitmentUtils.getPedersenCommitment(normalizedValue, BigInt(claimsData.salt), pedGenParams)
-    );
-  });
-
+  const leaves = claimEntries.map(([key, claim]) => computeLeafForClaim(key, claim, claimTags));
   return { claimEntries, leaves };
 }
 
@@ -110,8 +117,12 @@ function nextPowerOfTwoInt(n) {
   return p;
 }
 
-function generateStarkProofForClaim(claimKey, rawValue, witness, meta, reqMeta) {
+function generateStarkProofForClaim(claimKey, claim, meta, reqMeta) {
   ensureRustBinaryExists();
+
+  if (Number(claim.scale) !== Number(meta.scale) || Number(claim.claimTag) !== Number(meta.claim_tag)) {
+    throw new Error(`claimTags.json metadata does not match credential for "${claimKey}"`);
+  }
 
   const encodedMin = encodeBound(reqMeta.min, meta.scale);
   const encodedMax = encodeBound(reqMeta.max, meta.scale);
@@ -125,11 +136,11 @@ function generateStarkProofForClaim(claimKey, rawValue, witness, meta, reqMeta) 
 
   const args = [
     'prove',
-    '--value', witness.encodedValue,
+    '--value', claim.encodedValue,
     '--min', encodedMin.toString(),
     '--max', encodedMax.toString(),
-    '--claim-tag', String(witness.claimTag),
-    '--blinding', witness.blinding,
+    '--claim-tag', String(claim.claimTag),
+    '--blinding', claim.blinding,
     '--bits', String(bits),
     '--out', outFile,
   ];
@@ -167,22 +178,23 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
   const tree = await buildPoseidonTree(leaves);
   // Generate proofs for the revealed claims
   const proofs = revealedClaims.disclosedClaims?.reduce((acc, claimKey) => {
-    const claimValue = claimsData.claims[claimKey];
     if (!(claimKey in leafIndexByKey)) {
       throw new Error(`Claim "${claimKey}" not found in credential`);
     }
-    var value = claimValue;
-    if (typeof value === 'string')
-      value = stringToBigInt(value)
-    else 
-      value = BigInt(Math.round(value));
-    
+    const claim = claimsData.claims[claimKey];
+
+    if (isStarkNumericClaim(claimKey, claim.value, claimTags)) {
+      throw new Error(
+        `Claim "${claimKey}" is a STARK numeric claim (no salt, polynomial leaf). ` +
+        `Request it via numericalClaims instead of disclosedClaims.`
+      );
+    }
+
     const proof = getProof(tree, leafIndexByKey[claimKey]);
-    
-    // Store the claim and its proof
+
     acc[claimKey] = {
-      value: claimValue,
-      salt: BigInt(claimsData.salt).toString(),
+      value: claim.value,
+      salt: claim.salt,
       proof
     };
 
@@ -190,25 +202,20 @@ async function generateProofsForRevealedClaims(claimsJsonFilePath, revealedClaim
   }, {}) || {};
   const numericProof = revealedClaims.numericalClaims?.reduce((acc, reqMeta) => {
     const claimKey = reqMeta.claim;
-    const claimValue = claimsData.claims[claimKey];
     if (!(claimKey in leafIndexByKey)) {
       throw new Error(`Numerical claim "${claimKey}" not found in credential`);
     }
-    const meta = getClaimMeta(claimKey, claimTags);
-    const witness = claimsData.numericWitness?.[claimKey];
-    if (!witness) {
-      throw new Error(`Missing numericWitness for claim "${claimKey}"`);
+    const claim = claimsData.claims[claimKey];
+    if (!isStarkNumericClaim(claimKey, claim.value, claimTags)) {
+      throw new Error(`Claim "${claimKey}" is not a STARK numeric claim`);
     }
+    const meta = getClaimMeta(claimKey, claimTags);
 
-    const leafDigest = computeLeafDigestHexFromEncoded(
-      BigInt(witness.encodedValue),
-      BigInt(witness.claimTag),
-      BigInt(witness.blinding)
-    );
-    const proof = getProof(tree, leafIndexByKey[claimKey]);
-    const stark = generateStarkProofForClaim(claimKey, claimValue, witness, meta, reqMeta);
+    const leafIndex = leafIndexByKey[claimKey];
+    const leafDigest = leaves[leafIndex]; // already computed in buildAllLeaves
+    const proof = getProof(tree, leafIndex);
+    const stark = generateStarkProofForClaim(claimKey, claim, meta, reqMeta);
 
-    // Store the claim and its proof
     acc[claimKey] = {
       leaf_digest: leafDigest,
       proof,

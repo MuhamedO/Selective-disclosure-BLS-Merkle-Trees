@@ -37,18 +37,18 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
   const claimsData = JSON.parse(fs.readFileSync(claimsJsonFilePath, 'utf8'));
   const claimTags = loadClaimTags();
 
-  const salt = Rand.randUnder(pedGenParams.n);
-
-  const numericWitness = {};
-  const claimEntries = Object.entries(claimsData);
-  // Convert the claims object into an array of strings (key:value) for the leaves
-  const leaves = claimEntries.map(([key, value]) => {
+  // Each claim becomes { value, ...its own secret randomness }:
+  //  - STARK numeric claims: blinding + encoding metadata (for the polynomial leaf digest)
+  //  - all other claims: an individual Pedersen salt
+  const claims = {};
+  const leaves = Object.entries(claimsData).map(([key, value]) => {
     if (isStarkNumericClaim(key, value, claimTags)) {
       const meta = getClaimMeta(key, claimTags);
       const blinding = randomBlinding();
       const encodedValue = encodeNumericClaimValue(value, meta.scale);
 
-      numericWitness[key] = {
+      claims[key] = {
+        value,
         blinding: blinding.toString(),
         encodedValue: encodedValue.toString(),
         claimTag: meta.claim_tag,
@@ -58,12 +58,12 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
       return computeLeafDigestHexFromEncoded(encodedValue, meta.claim_tag, blinding);
     }
 
-    let normalizedValue = value;
-    if (typeof normalizedValue === 'string') {
-      normalizedValue = stringToBigInt(normalizedValue);
-    } else {
-      normalizedValue = BigInt(Math.round(normalizedValue));
-    }
+    const salt = Rand.randUnder(pedGenParams.n);
+    claims[key] = { value, salt: salt.toString() };
+
+    const normalizedValue = typeof value === 'string'
+      ? stringToBigInt(value)
+      : BigInt(Math.round(value));
 
     return PointFn.toHexString(
       CommitmentUtils.getPedersenCommitment(normalizedValue, salt, pedGenParams)
@@ -98,11 +98,10 @@ async function createAndSignCredential(claimsJsonFilePath, privateKeyJsonFilePat
   };
 
   const output2 = {
-    claims: claimsData,
+    claims,
     issuer: privateKeyData.issuer,
-    salt: salt.toString(),
-    numericWitness
   };
+
 
   // Write the output to a JSON file
   const outputFilename = `${privateKeyData.issuer.replace(/[^a-z0-9]/gi, '_')}_${path.parse(claimsJsonFilePath).name}_signature.json`;

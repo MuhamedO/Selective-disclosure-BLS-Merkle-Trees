@@ -19,6 +19,6 @@
     "bls-signatures": "^2.0.2",
     "circomlibjs": "^0.1.7",
     "commander": "^12.0.0",
-    "merkletreejs": "^0.3.11"
+    "merkletreejs": "^0.6.0"
   }
 }
